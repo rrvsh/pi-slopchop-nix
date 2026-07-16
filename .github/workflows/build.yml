@@ -1,0 +1,51 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux build
+            system: x86_64-linux
+            runner: ubuntu-latest
+          - name: Darwin build
+            system: aarch64-darwin
+            runner: macos-latest
+    steps:
+      - name: Checkout repository
+        timeout-minutes: 5
+        uses: actions/checkout@v6
+
+      - name: Install Nix
+        timeout-minutes: 10
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure rrvsh Cachix
+        timeout-minutes: 10
+        uses: cachix/cachix-action@v17
+        with:
+          name: rrvsh
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      # Push both the npm-deps fixed-output derivation and the final package so
+      # restricted downstream hosts can substitute instead of contacting npm.
+      - name: Build pi-slopchop and npm deps
+        timeout-minutes: 120
+        run: |
+          nix build --print-build-logs ".#packages.${{ matrix.system }}.pi-slopchop.npmDeps"
+          nix build --print-build-logs ".#packages.${{ matrix.system }}.pi-slopchop"
