@@ -1,0 +1,351 @@
+diff --git a/src/index.ts b/src/index.ts
+index c251817..5bf7189 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,3 +1,5 @@
++import { existsSync, statSync } from "node:fs";
++import { dirname, isAbsolute, parse, resolve } from "node:path";
+ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+ import { getReviewWindowData, getSubmoduleReviewWindowData, loadReviewFileContents } from "./git.js";
+ import { composeReviewPrompt } from "./prompt.js";
+@@ -5,6 +7,122 @@ import { loadCommentShortcuts } from "./shortcuts.js";
+ import { hasExactSubmoduleRange } from "./types.js";
+ import { runReviewApp } from "./ui/review-app.js";
+ 
++interface ReviewWindowData {
++  repoRoot: string;
++  files: Awaited<ReturnType<typeof getReviewWindowData>>["files"];
++}
++
++interface RepoCandidate {
++  repoRoot: string;
++  count: number;
++}
++
++function getPathDirectory(path: string): string {
++  try {
++    if (existsSync(path) && statSync(path).isDirectory()) return path;
++  } catch {
++    // Fall through to dirname for inaccessible paths.
++  }
++
++  return dirname(path);
++}
++
++function getSessionModifiedPaths(ctx: ExtensionContext): string[] {
++  const paths: string[] = [];
++
++  for (const entry of ctx.sessionManager.getBranch() as any[]) {
++    if ((entry.type === "compaction" || entry.type === "branch_summary") && Array.isArray(entry.details?.modifiedFiles)) {
++      for (const path of entry.details.modifiedFiles) {
++        if (typeof path === "string" && path.length > 0) paths.push(path);
++      }
++    }
++
++    if (entry.type !== "message" || entry.message?.role !== "assistant" || !Array.isArray(entry.message.content)) continue;
++
++    for (const block of entry.message.content) {
++      if (block?.type !== "toolCall") continue;
++      if (block.name !== "edit" && block.name !== "write") continue;
++      const path = block.arguments?.path;
++      if (typeof path === "string" && path.length > 0) paths.push(path);
++    }
++  }
++
++  return paths;
++}
++
++async function findGitRoot(pi: ExtensionAPI, startPath: string): Promise<string | null> {
++  let cwd = getPathDirectory(startPath);
++
++  while (true) {
++    const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd });
++    if (result.code === 0) {
++      const repoRoot = result.stdout.trim();
++      if (repoRoot.length > 0) return repoRoot;
++    }
++
++    const parent = dirname(cwd);
++    if (parent === cwd || parse(cwd).root === cwd) return null;
++    cwd = parent;
++  }
++}
++
++async function getSessionRepoCandidates(pi: ExtensionAPI, ctx: ExtensionContext): Promise<RepoCandidate[]> {
++  const counts = new Map<string, number>();
++  const seenPaths = new Set<string>();
++
++  for (const rawPath of getSessionModifiedPaths(ctx)) {
++    const absolutePath = isAbsolute(rawPath) ? rawPath : resolve(ctx.cwd, rawPath);
++    if (seenPaths.has(absolutePath)) continue;
++    seenPaths.add(absolutePath);
++
++    const repoRoot = await findGitRoot(pi, absolutePath);
++    if (repoRoot == null) continue;
++    counts.set(repoRoot, (counts.get(repoRoot) ?? 0) + 1);
++  }
++
++  return [...counts.entries()]
++    .map(([repoRoot, count]) => ({ repoRoot, count }))
++    .sort((a, b) => b.count - a.count || a.repoRoot.localeCompare(b.repoRoot));
++}
++
++async function getReviewDataIfAvailable(pi: ExtensionAPI, cwd: string): Promise<ReviewWindowData | null> {
++  try {
++    const data = await getReviewWindowData(pi, cwd);
++    return data.files.length > 0 ? data : null;
++  } catch {
++    return null;
++  }
++}
++
++async function chooseInferredReviewData(pi: ExtensionAPI, ctx: ExtensionContext): Promise<ReviewWindowData | null> {
++  const candidates = await getSessionRepoCandidates(pi, ctx);
++  const reviewable: Array<RepoCandidate & { data: ReviewWindowData }> = [];
++
++  for (const candidate of candidates) {
++    const data = await getReviewDataIfAvailable(pi, candidate.repoRoot);
++    if (data != null) reviewable.push({ ...candidate, data });
++  }
++
++  if (reviewable.length === 0) return null;
++  if (reviewable.length === 1 || !ctx.hasUI) return reviewable[0].data;
++
++  const labels = reviewable.map((candidate) => `${candidate.repoRoot} (${candidate.count} session change${candidate.count === 1 ? "" : "s"})`);
++  const selected = await ctx.ui.select("Choose repository to review", labels);
++  if (selected == null) return null;
++
++  const selectedIndex = labels.indexOf(selected);
++  return selectedIndex >= 0 ? reviewable[selectedIndex].data : null;
++}
++
++async function resolveReviewData(pi: ExtensionAPI, ctx: ExtensionContext, args: string): Promise<ReviewWindowData | null> {
++  const target = args.trim();
++  if (target.length > 0) {
++    return getReviewDataIfAvailable(pi, isAbsolute(target) ? target : resolve(ctx.cwd, target));
++  }
++
++  return (await getReviewDataIfAvailable(pi, ctx.cwd)) ?? chooseInferredReviewData(pi, ctx);
++}
++
+ export default function slopReviewExtension(pi: ExtensionAPI) {
+   const initialShortcutConfig = loadCommentShortcuts();
+   let activeReview = false;
+@@ -14,7 +132,7 @@ export default function slopReviewExtension(pi: ExtensionAPI) {
+     ctx.ui.notify(`slopchop config: ${warnings.join(" ")}`, "warning");
+   }
+ 
+-  async function openReview(ctx: ExtensionContext): Promise<void> {
++  async function openReview(ctx: ExtensionContext, args = ""): Promise<void> {
+     if (activeReview) {
+       ctx.ui.notify("A review session is already open.", "warning");
+       return;
+@@ -22,12 +140,13 @@ export default function slopReviewExtension(pi: ExtensionAPI) {
+ 
+     activeReview = true;
+     try {
+-      const { repoRoot, files } = await getReviewWindowData(pi, ctx.cwd);
++      const reviewData = await resolveReviewData(pi, ctx, args);
+       const shortcutConfig = loadCommentShortcuts();
+-      if (files.length === 0) {
++      if (reviewData == null) {
+         ctx.ui.notify("No reviewable files found for git diff, last commit, or all files.", "info");
+         return;
+       }
++      const { repoRoot, files } = reviewData;
+ 
+       notifyShortcutWarnings(ctx, shortcutConfig.warnings);
+ 
+@@ -64,7 +183,7 @@ export default function slopReviewExtension(pi: ExtensionAPI) {
+   const reviewCommand = {
+     description: "Review and annotate code changes",
+     handler: async (_args: string, ctx: ExtensionContext) => {
+-      await openReview(ctx);
++      await openReview(ctx, _args);
+     },
+   };
+ 
+diff --git a/src/test/index.test.ts b/src/test/index.test.ts
+index 152adba..3a3cd5f 100644
+--- a/src/test/index.test.ts
++++ b/src/test/index.test.ts
+@@ -143,4 +143,179 @@ describe("slop review extension", () => {
+     expect(mocks.getSubmoduleReviewWindowData).not.toHaveBeenCalled();
+     expect(mocks.getReviewWindowData).toHaveBeenNthCalledWith(2, pi, "/repo/submodule-1");
+   });
++
++  it("infers the review repository from assistant edit tool calls when the session cwd is not reviewable", async () => {
++    const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
++    const pi = {
++      exec: vi.fn(async (_command: string, _args: string[], options?: { cwd?: string }) => ({ code: 0, stdout: options?.cwd?.startsWith("/home/rafiq/Git/tools") ? "/home/rafiq/Git/tools\n" : "", stderr: "" })),
++      registerCommand: vi.fn((name: string, command) => commands.set(name, command)),
++      registerShortcut: vi.fn(),
++      on: vi.fn(),
++    };
++    const ctx = {
++      cwd: "/home/rafiq",
++      hasUI: true,
++      sessionManager: {
++        getBranch: vi.fn(() => [{
++          type: "message",
++          message: {
++            role: "assistant",
++            content: [{ type: "toolCall", name: "edit", arguments: { path: "Git/tools/nix/modules/pi-agent.nix" } }],
++          },
++        }]),
++      },
++      ui: {
++        notify: vi.fn(),
++        select: vi.fn(),
++        setEditorText: vi.fn(),
++      },
++    };
++    const inferredFiles = [{ id: "pi-agent", path: "nix/modules/pi-agent.nix" }];
++
++    mocks.getReviewWindowData
++      .mockResolvedValueOnce({ repoRoot: "/home/rafiq", files: [] })
++      .mockResolvedValueOnce({ repoRoot: "/home/rafiq/Git/tools", files: inferredFiles });
++    mocks.runReviewApp.mockResolvedValue({
++      result: { type: "submit", allComment: "", allIntent: "fix", comments: [] },
++      files: inferredFiles,
++    });
++    mocks.composeReviewPrompt.mockReturnValue("prompt body");
++
++    slopReviewExtension(pi as never);
++    await commands.get("diff")?.handler("", ctx);
++
++    expect(mocks.getReviewWindowData).toHaveBeenNthCalledWith(1, pi, "/home/rafiq");
++    expect(mocks.getReviewWindowData).toHaveBeenNthCalledWith(2, pi, "/home/rafiq/Git/tools");
++    expect(mocks.runReviewApp).toHaveBeenCalledWith(ctx, expect.objectContaining({ repoRoot: "/home/rafiq/Git/tools", files: inferredFiles }));
++  });
++
++  it("infers the review repository from compaction modified file details", async () => {
++    const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
++    const pi = {
++      exec: vi.fn(async () => ({ code: 0, stdout: "/home/rafiq/Git/tools\n", stderr: "" })),
++      registerCommand: vi.fn((name: string, command) => commands.set(name, command)),
++      registerShortcut: vi.fn(),
++      on: vi.fn(),
++    };
++    const ctx = {
++      cwd: "/home/rafiq",
++      hasUI: true,
++      sessionManager: {
++        getBranch: vi.fn(() => [{ type: "compaction", details: { modifiedFiles: ["Git/tools/flake.nix"] } }]),
++      },
++      ui: {
++        notify: vi.fn(),
++        select: vi.fn(),
++        setEditorText: vi.fn(),
++      },
++    };
++    const inferredFiles = [{ id: "flake", path: "flake.nix" }];
++
++    mocks.getReviewWindowData
++      .mockRejectedValueOnce(new Error("Not inside a git repository."))
++      .mockResolvedValueOnce({ repoRoot: "/home/rafiq/Git/tools", files: inferredFiles });
++    mocks.runReviewApp.mockResolvedValue({
++      result: { type: "submit", allComment: "", allIntent: "fix", comments: [] },
++      files: inferredFiles,
++    });
++    mocks.composeReviewPrompt.mockReturnValue("prompt body");
++
++    slopReviewExtension(pi as never);
++    await commands.get("diff")?.handler("", ctx);
++
++    expect(mocks.getReviewWindowData).toHaveBeenNthCalledWith(2, pi, "/home/rafiq/Git/tools");
++  });
++
++  it("prompts when multiple inferred repositories are reviewable", async () => {
++    const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
++    const pi = {
++      exec: vi.fn(async (_command: string, _args: string[], options?: { cwd?: string }) => {
++        const cwd = options?.cwd ?? "";
++        if (cwd.startsWith("/home/rafiq/Git/tools")) return { code: 0, stdout: "/home/rafiq/Git/tools\n", stderr: "" };
++        if (cwd.startsWith("/home/rafiq/Git/app")) return { code: 0, stdout: "/home/rafiq/Git/app\n", stderr: "" };
++        return { code: 1, stdout: "", stderr: "" };
++      }),
++      registerCommand: vi.fn((name: string, command) => commands.set(name, command)),
++      registerShortcut: vi.fn(),
++      on: vi.fn(),
++    };
++    const ctx = {
++      cwd: "/home/rafiq",
++      hasUI: true,
++      sessionManager: {
++        getBranch: vi.fn(() => [{
++          type: "message",
++          message: {
++            role: "assistant",
++            content: [
++              { type: "toolCall", name: "edit", arguments: { path: "Git/tools/a.nix" } },
++              { type: "toolCall", name: "write", arguments: { path: "Git/app/src/app.ts" } },
++            ],
++          },
++        }]),
++      },
++      ui: {
++        notify: vi.fn(),
++        select: vi.fn(async () => "/home/rafiq/Git/app (1 session change)"),
++        setEditorText: vi.fn(),
++      },
++    };
++    const toolsFiles = [{ id: "tools", path: "a.nix" }];
++    const appFiles = [{ id: "app", path: "src/app.ts" }];
++
++    mocks.getReviewWindowData
++      .mockResolvedValueOnce({ repoRoot: "/home/rafiq", files: [] })
++      .mockResolvedValueOnce({ repoRoot: "/home/rafiq/Git/app", files: appFiles })
++      .mockResolvedValueOnce({ repoRoot: "/home/rafiq/Git/tools", files: toolsFiles });
++    mocks.runReviewApp.mockResolvedValue({
++      result: { type: "submit", allComment: "", allIntent: "fix", comments: [] },
++      files: appFiles,
++    });
++    mocks.composeReviewPrompt.mockReturnValue("prompt body");
++
++    slopReviewExtension(pi as never);
++    await commands.get("diff")?.handler("", ctx);
++
++    expect(ctx.ui.select).toHaveBeenCalledWith("Choose repository to review", [
++      "/home/rafiq/Git/app (1 session change)",
++      "/home/rafiq/Git/tools (1 session change)",
++    ]);
++    expect(mocks.runReviewApp).toHaveBeenCalledWith(ctx, expect.objectContaining({ repoRoot: "/home/rafiq/Git/app", files: appFiles }));
++  });
++
++  it("uses an explicit command path without session inference", async () => {
++    const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
++    const pi = {
++      exec: vi.fn(),
++      registerCommand: vi.fn((name: string, command) => commands.set(name, command)),
++      registerShortcut: vi.fn(),
++      on: vi.fn(),
++    };
++    const ctx = {
++      cwd: "/home/rafiq",
++      hasUI: true,
++      sessionManager: { getBranch: vi.fn(() => []) },
++      ui: {
++        notify: vi.fn(),
++        select: vi.fn(),
++        setEditorText: vi.fn(),
++      },
++    };
++    const files = [{ id: "pi-agent", path: "nix/modules/pi-agent.nix" }];
++
++    mocks.getReviewWindowData.mockResolvedValueOnce({ repoRoot: "/home/rafiq/Git/tools", files });
++    mocks.runReviewApp.mockResolvedValue({
++      result: { type: "submit", allComment: "", allIntent: "fix", comments: [] },
++      files,
++    });
++    mocks.composeReviewPrompt.mockReturnValue("prompt body");
++
++    slopReviewExtension(pi as never);
++    await commands.get("diff")?.handler("Git/tools", ctx);
++
++    expect(mocks.getReviewWindowData).toHaveBeenCalledTimes(1);
++    expect(mocks.getReviewWindowData).toHaveBeenCalledWith(pi, "/home/rafiq/Git/tools");
++    expect(ctx.sessionManager.getBranch).not.toHaveBeenCalled();
++  });
++
+ });
