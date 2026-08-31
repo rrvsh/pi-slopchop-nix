@@ -21,7 +21,10 @@ in
         };
 
         npmDepsHash = versionInfo.npmDepsHash;
-        patches = [ ../patches/infer-review-repo-from-session-files.patch ];
+        patches = [
+          ../patches/infer-review-repo-from-session-files.patch
+          ../patches/default-side-by-side-wrapped-diff.patch
+        ];
         nodejs = pkgs.nodejs_22;
 
         dontNpmBuild = true;

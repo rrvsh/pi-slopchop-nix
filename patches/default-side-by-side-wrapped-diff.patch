@@ -1,0 +1,26 @@
+diff --git a/src/state.ts b/src/state.ts
+index 74749a0..8565174 100644
+--- a/src/state.ts
++++ b/src/state.ts
+@@ -83,7 +83,7 @@ export function createInitialReviewState(files: ReviewFile[]): ReviewState {
+     activeFileId: scoped[0]?.id ?? null,
+     searchQuery: "",
+     focus: "navigator",
+-    wrapLines: false,
++    wrapLines: true,
+     hideUnchanged: false,
+     selectedCommentIndex: 0,
+     selectedLineTargetByScopeFile: {},
+diff --git a/src/ui/review-app.ts b/src/ui/review-app.ts
+index 6a7bb9f..83e7698 100644
+--- a/src/ui/review-app.ts
++++ b/src/ui/review-app.ts
+@@ -827,7 +827,7 @@ class ReviewApp {
+   private searchBuffer = "";
+   private shortcutMode = false;
+   private helpMode = false;
+-  private diffViewMode: DiffViewMode = "unified";
++  private diffViewMode: DiffViewMode = "side-by-side";
+   private confirmCancel = false;
+   private commentsHidden = false;
+   private externalEditorOpen = false;
