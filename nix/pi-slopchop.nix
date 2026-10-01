@@ -24,8 +24,10 @@ in
         patches = [
           ../patches/infer-review-repo-from-session-files.patch
           ../patches/default-side-by-side-wrapped-diff.patch
+          ../patches/pi-tui-peer-dependency.patch
         ];
         nodejs = pkgs.nodejs_22;
+        npmPruneFlags = [ "--omit=peer" ];
 
         dontNpmBuild = true;
 
@@ -54,7 +56,22 @@ in
           if (!Array.isArray(manifest.pi?.extensions) || !manifest.pi.extensions.includes("./src/index.ts")) {
             throw new Error("missing Pi extension metadata for ./src/index.ts");
           }
+          if (manifest.dependencies?.["@earendil-works/pi-tui"] !== undefined) {
+            throw new Error("pi-tui must not be a runtime dependency");
+          }
+          if (manifest.peerDependencies?.["@earendil-works/pi-tui"] !== "*") {
+            throw new Error("pi-tui must be a wildcard peer dependency");
+          }
           NODE
+          for hostPackage in \
+            @earendil-works/pi-agent-core \
+            @earendil-works/pi-ai \
+            @earendil-works/pi-coding-agent \
+            @earendil-works/pi-tui \
+            typebox
+          do
+            test ! -e "$pkg/node_modules/$hostPackage"
+          done
           runHook postInstallCheck
         '';
 
